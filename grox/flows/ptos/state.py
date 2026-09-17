@@ -40,6 +40,7 @@ class SafetyPolicyType(str, Enum):
     SpamEngagementBaiting = "SpamEngagementBaiting"
     SpamCardManipulation = "SpamCardManipulation"
     SpamMentionAbuse = "SpamMentionAbuse"
+    SpamManipulatedMedia = "SpamManipulatedMedia"
     IllegalAndRegulatedBehaviorsSexualServices = (
         "IllegalAndRegulatedBehaviorsSexualServices"
     )

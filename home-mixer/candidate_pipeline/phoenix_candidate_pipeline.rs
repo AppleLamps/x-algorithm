@@ -42,6 +42,7 @@ use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
 use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
+use crate::filters::fav_holdout_filter::FavHoldoutFilter;
 use crate::filters::ineligible_subscription_filter::IneligibleSubscriptionFilter;
 use crate::filters::inventory_holdout_filter::InventoryHoldoutFilter;
 use crate::filters::new_user_min_engagement_filter::NewUserMinEngagementFilter;
@@ -380,6 +381,7 @@ impl PhoenixCandidatePipeline {
             Box::new(TopicIdsFilter),
             Box::new(NewUserMinEngagementFilter),
             Box::new(InventoryHoldoutFilter),
+            Box::new(FavHoldoutFilter),
         ];
 
         let xds_client = super::build_phoenix_xds_client(phoenix_xds).await;

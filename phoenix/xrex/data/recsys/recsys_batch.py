@@ -309,7 +309,7 @@ class RecsysFeaturesBatch(TypedDict):
     user_installed_apps_multihot: npt.NDArray[np.bool_]
     num_positive_candidates: npt.NDArray[np.int32] | None
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
-    sample_source: NotRequired[npt.NDArray[np.bool_] | None]
+    sample_source: NotRequired[npt.NDArray[np.int8] | None]
     packing_layout: NotRequired[SequencePackedLayout | None]
 
 
@@ -1032,13 +1032,13 @@ def from_record_batch(
             else np.ones((batch_size, 1), dtype=np.float32)
         ),
         sample_source=(
-            record_batch.column("is_delayed_feedback")
-            .fill_null(False)
+            record_batch.column("sample_source")
+            .fill_null(0)
             .to_numpy(zero_copy_only=False)
-            .astype(np.bool_)
+            .astype(np.int8)
             .reshape(-1, 1)
-            if "is_delayed_feedback" in record_batch.schema.names
-            else np.zeros((batch_size, 1), dtype=np.bool_)
+            if "sample_source" in record_batch.schema.names
+            else np.zeros((batch_size, 1), dtype=np.int8)
         ),
     )
     batch["num_positive_candidates"] = (

@@ -7,6 +7,7 @@ pub mod core_data_hydration_filter;
 pub mod dedup_conversation_filter;
 pub mod drop_duplicates_filter;
 
+pub mod fav_holdout_filter;
 pub mod following_retweet_deduplication_filter;
 pub mod following_viewer_muted_keyword_filter;
 pub mod ineligible_subscription_filter;

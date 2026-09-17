@@ -13,13 +13,12 @@ from xrex.cuda.async_emb.comm_utils import (
 )
 
 try:
-    from xrex.cuda.async_emb.src import async_emb_api
-except ImportError as e:
+    import xrex_cuda_kernels.async_emb_api as async_emb_api
+except ModuleNotFoundError as e:
     raise ImportError(
-        "no compiled async_emb binding: xrex.cuda.async_emb.src has no "
-        "async_emb_api extension on this box (compile src/ per the "
-        "xrex/cuda/__init__.py build notes). use_async_emb requires the "
-        "kernels."
+        "no compiled async_emb binding: the xrex-cuda-kernels package is not "
+        "installed in this environment."
+        " use_async_emb requires the kernels."
     ) from e
 
 try:

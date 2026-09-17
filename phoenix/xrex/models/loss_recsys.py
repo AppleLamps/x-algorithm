@@ -96,7 +96,7 @@ def purchase_value_valid_mask(
     label_valid: jax.Array,
     padding_mask: jax.Array,
     negative_sample_mask: jax.Array,
-    delayed_mask: jax.Array,
+    sample_source: jax.Array,
     has_click: jax.Array,
     has_purchase: jax.Array,
     keeper_mask: jax.Array,
@@ -105,7 +105,7 @@ def purchase_value_valid_mask(
         label_valid.astype(jnp.bool_)
         & padding_mask.astype(jnp.bool_)
         & ~negative_sample_mask.astype(jnp.bool_)
-        & delayed_mask.astype(jnp.bool_)
+        & (sample_source > 0)
         & has_click.astype(jnp.bool_)
         & has_purchase.astype(jnp.bool_)
         & keeper_mask.astype(jnp.bool_)

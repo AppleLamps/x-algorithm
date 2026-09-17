@@ -34,11 +34,7 @@ pub(crate) struct ScoringWeights {
     quoted_vqv: f64,
     cont_dwell_time: f64,
     cont_click_dwell_time: f64,
-    enable_click_dwell_low_fav_rate_penalty: bool,
-    click_dwell_low_fav_rate_penalty_baseline: f64,
-    click_dwell_low_fav_rate_penalty_alpha: f64,
-    click_dwell_low_fav_rate_penalty_floor: f64,
-    click_dwell_low_fav_rate_penalty_cap: f64,
+    enable_cdwell_on_impr: bool,
     cont_active_secs_5m_residual_norm: f64,
     follow_author: f64,
     post_unexplored: f64,
@@ -78,12 +74,7 @@ impl ScoringWeights {
         let quoted_vqv = params.get(QuotedVqvWeight);
         let cont_dwell_time = params.get(ContDwellTimeWeight);
         let cont_click_dwell_time = params.get(ContClickDwellTimeWeight);
-        let enable_click_dwell_low_fav_rate_penalty = params.get(EnableClickDwellLowFavRatePenalty);
-        let click_dwell_low_fav_rate_penalty_baseline =
-            params.get(ClickDwellLowFavRatePenaltyBaseline);
-        let click_dwell_low_fav_rate_penalty_alpha = params.get(ClickDwellLowFavRatePenaltyAlpha);
-        let click_dwell_low_fav_rate_penalty_floor = params.get(ClickDwellLowFavRatePenaltyFloor);
-        let click_dwell_low_fav_rate_penalty_cap = params.get(ClickDwellLowFavRatePenaltyCap);
+        let enable_cdwell_on_impr = params.get(EnableCdwellOnImpr);
         let cont_active_secs_5m_residual_norm = params.get(ContActiveSecs5mResidualNormWeight);
         let follow_author = params.get(FollowAuthorWeight);
         let post_unexplored = params.get(PostUnexploredWeight);
@@ -121,11 +112,7 @@ impl ScoringWeights {
             quoted_vqv,
             cont_dwell_time,
             cont_click_dwell_time,
-            enable_click_dwell_low_fav_rate_penalty,
-            click_dwell_low_fav_rate_penalty_baseline,
-            click_dwell_low_fav_rate_penalty_alpha,
-            click_dwell_low_fav_rate_penalty_floor,
-            click_dwell_low_fav_rate_penalty_cap,
+            enable_cdwell_on_impr,
             cont_active_secs_5m_residual_norm,
             follow_author,
             post_unexplored,
@@ -256,21 +243,12 @@ impl ScoringWeights {
         self.reply
     }
 
-    fn low_fav_penalized_click_dwell(&self, scores: &PhoenixScores) -> Option<f64> {
-        if !self.enable_click_dwell_low_fav_rate_penalty {
+    fn click_dwell_term(&self, scores: &PhoenixScores) -> Option<f64> {
+        if !self.enable_cdwell_on_impr {
             return scores.click_dwell_time;
         }
-        match (scores.click_dwell_time, scores.favorite_score) {
-            (Some(cd), Some(fav)) => {
-                let baseline = self
-                    .click_dwell_low_fav_rate_penalty_baseline
-                    .max(f64::EPSILON);
-                let multiplier = (fav / baseline)
-                    .powf(self.click_dwell_low_fav_rate_penalty_alpha)
-                    .max(self.click_dwell_low_fav_rate_penalty_floor)
-                    .min(self.click_dwell_low_fav_rate_penalty_cap);
-                Some(cd * multiplier)
-            }
+        match (scores.click_dwell_time, scores.click_score) {
+            (Some(cd), Some(click)) => Some(cd * click),
             (cd, None) => cd,
             (None, _) => None,
         }
@@ -347,8 +325,8 @@ impl ScoringWeights {
                     self.post_unexplored_in_network_only as u8 as f64,
                 ),
                 (
-                    "gate.click_dwell_low_fav_rate_penalty",
-                    self.enable_click_dwell_low_fav_rate_penalty as u8 as f64,
+                    "gate.cdwell_on_impr",
+                    self.enable_cdwell_on_impr as u8 as f64,
                 ),
             ]
             .map(|(k, v)| (k.to_string(), v)),
@@ -501,7 +479,7 @@ impl RankingScorer {
             Self::apply(scores.quoted_vqv_score, quoted_vqv_weight),
             dwell_time_term,
             Self::apply(
-                weights.low_fav_penalized_click_dwell(scores),
+                weights.click_dwell_term(scores),
                 weights.cont_click_dwell_time,
             ),
             Self::apply(

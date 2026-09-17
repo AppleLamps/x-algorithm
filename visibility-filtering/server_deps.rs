@@ -17,6 +17,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+use xai_cache::discovery::WilyDiscovery;
+use xai_cache::{
+    CacheClient, ClientBuilder, ClientConfig, HashAlgorithm, Key, Protocol, TlsConfig,
+};
 use xai_core_entities::gizmoduck_client::ProdGizmoduckClient;
 use xai_core_entities::rpc_constants::{GizmoduckRpcConstants, RpcConstants, TESRpcConstants};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CLIENT_ID, S2S_CRT_PATH, S2S_KEY_PATH};
@@ -207,18 +211,27 @@ pub async fn build_prod_server(
     let twemcache_client_name = crate::config::twemcache_client_name();
     let twemcache = Arc::new(
         init_client_with_retry("twemcache", init_deadline, || {
-            crate::twemcache::TwemcacheClient::new_with_tls_paths(
-                CACHE_PATH,
-                twemcache_client_name.clone(),
-                datacenter,
-                &S2S_CHAIN_PATH,
-                &S2S_CRT_PATH,
-                &S2S_KEY_PATH,
-                Duration::from_millis(20),
-                Duration::from_secs(5),
-                crate::twemcache::client::default_connections_per_host(),
-                crate::twemcache::client::default_depth_cap(),
-            )
+            let name = twemcache_client_name.clone();
+            let zone = datacenter.to_string();
+            async move {
+                let discovery = Arc::new(WilyDiscovery::new(CACHE_PATH, name, zone).await?);
+                let config = ClientConfig::builder()
+                    .request_timeout(Duration::from_millis(20))
+                    .connect_timeout(Duration::from_secs(5))
+                    .hash_algorithm(HashAlgorithm::FNV1)
+                    .connections_per_endpoint(2)
+                    .depth_cap(100)
+                    .failure_accrual_enabled(false)
+                    .build();
+                ClientBuilder::new(Protocol::Memcached, discovery, config)
+                    .with_tls(TlsConfig {
+                        ca_cert_path: S2S_CHAIN_PATH.clone(),
+                        client_cert_path: S2S_CRT_PATH.clone(),
+                        client_key_path: S2S_KEY_PATH.clone(),
+                    })
+                    .build()
+                    .await
+            }
         })
         .await
         .expect("Failed to create twemcache client"),
@@ -428,9 +441,9 @@ async fn build_xds_strato(
     Ok(strato)
 }
 
-async fn warm_cache(twemcache: &crate::twemcache::TwemcacheClient) {
+async fn warm_cache(twemcache: &CacheClient) {
     let start = Instant::now();
-    let key = match crate::twemcache::Key::new(b"slm_warmup".to_vec()) {
+    let key = match Key::new(b"slm_warmup".to_vec()) {
         Ok(key) => key,
         Err(e) => {
             warn!(error = %e, "Cache warmup key construction failed (non-fatal)");
@@ -438,20 +451,23 @@ async fn warm_cache(twemcache: &crate::twemcache::TwemcacheClient) {
         }
     };
     let latency_ms = || start.elapsed().as_millis() as u64;
-    match twemcache
-        .multi_get(std::slice::from_ref(&key))
-        .await
-        .get(&key)
-    {
-        Some(Ok(_)) => info!(latency_ms = latency_ms(), "Cache warmup succeeded"),
-        Some(Err(e)) => warn!(
+    match twemcache.multi_get(std::slice::from_ref(&key)).await {
+        Ok(map) => match map.get(&key) {
+            Some(Ok(_)) => info!(latency_ms = latency_ms(), "Cache warmup succeeded"),
+            Some(Err(e)) => warn!(
+                latency_ms = latency_ms(),
+                error = %e,
+                "Cache warmup failed (non-fatal)"
+            ),
+            None => warn!(
+                latency_ms = latency_ms(),
+                "Cache warmup returned no response (non-fatal)"
+            ),
+        },
+        Err(e) => warn!(
             latency_ms = latency_ms(),
             error = %e,
             "Cache warmup failed (non-fatal)"
-        ),
-        None => warn!(
-            latency_ms = latency_ms(),
-            "Cache warmup returned no response (non-fatal)"
         ),
     }
 }

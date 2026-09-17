@@ -729,9 +729,10 @@ class Trainer(Config):
         if jax.default_backend() != "gpu":
             host_memory_kind = "unpinned_host"
 
-        self.host_sharding = self.adjust_host_sharding(
-            jax.tree.map(lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding)
+        self.reload_host_sharding = jax.tree.map(
+            lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding
         )
+        self.host_sharding = self.adjust_host_sharding(self.reload_host_sharding)
 
         def h2d_copy(src, dst):
             dst = jax.device_put(src, self.state_sharding)
@@ -743,8 +744,8 @@ class Trainer(Config):
         self.reload_state = JittedOrCompiled(
             jax.jit(
                 h2d_copy,
-                in_shardings=(self.host_sharding, self.state_sharding),
-                out_shardings=(self.host_sharding, self.state_sharding),
+                in_shardings=(self.reload_host_sharding, self.state_sharding),
+                out_shardings=(self.reload_host_sharding, self.state_sharding),
                 donate_argnums=(0, 1),
                 keep_unused=True,
             )

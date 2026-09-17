@@ -48,6 +48,13 @@ impl VFServer {
 
 #[tonic::async_trait]
 impl vf_pb::VisibilityFilteringService for VFServer {
+    async fn evaluate_tweets(
+        &self,
+        _: Request<vf_pb::EvaluateTweetsRequest>,
+    ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+        Err(Status::unimplemented("EvaluateTweets is not served yet"))
+    }
+
     async fn filter_tweets(
         &self,
         request: Request<vf_pb::VisibilityFilterRequest>,

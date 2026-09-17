@@ -126,9 +126,9 @@ impl SafetyLabelSource {
 mod tests {
     use super::*;
 
-    use crate::twemcache::{Key, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::async_trait;
+    use xai_cache::{KVCacheError, Key, Value};
     use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
     use crate::safety_label_source::codec::{LkeyBytes, MvalBytes, RawSafetyLabel};
@@ -138,7 +138,7 @@ mod tests {
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
 
     struct FakeTwemcache {
-        results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         fetched_keys: Arc<AtomicUsize>,
     }
 
@@ -147,7 +147,7 @@ mod tests {
         async fn multi_get(
             &self,
             keys: &[Key],
-        ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>> {
+        ) -> HashMap<Key, std::result::Result<Option<Value>, KVCacheError>> {
             self.fetched_keys.fetch_add(keys.len(), Ordering::SeqCst);
             self.results.clone()
         }
@@ -171,14 +171,14 @@ mod tests {
     }
 
     fn make_source(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
     ) -> SafetyLabelSource {
         make_source_with_clock(cache_results, mh_items, Clock::new())
     }
 
     fn make_source_with_clock(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
         clock: Clock,
     ) -> SafetyLabelSource {
@@ -186,14 +186,14 @@ mod tests {
     }
 
     fn make_counting_source(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
         make_counting_source_with_clock(cache_results, mh_items, Clock::new())
     }
 
     fn make_counting_source_with_clock(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
         clock: Clock,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
@@ -293,10 +293,7 @@ mod tests {
         let source = make_source(
             HashMap::from([
                 (cache_key(10), Ok(Some(cached_one_label()))),
-                (
-                    cache_key(20),
-                    Err(crate::twemcache::TwemcacheError::Io("shard timeout".into())),
-                ),
+                (cache_key(20), Err(KVCacheError::Io("shard timeout".into()))),
                 (cache_key(30), Ok(None)),
             ]),
             HashMap::from([(

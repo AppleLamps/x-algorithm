@@ -660,6 +660,7 @@ pub(crate) async fn send_entries(
     offsets: Vec<usize>,
     sizes: Vec<usize>,
     buf: &mut [u8],
+    label: String,
     #[cfg(target_os = "linux")] arg: (Vec<usize>, Contexts, MRz),
 ) -> (usize, u32) {
     #[cfg(target_os = "linux")]
@@ -712,8 +713,15 @@ pub(crate) async fn send_entries(
         (3, repeated_bytes(&mut rmrs)),
         (4, proto_parser::bytes(&mut use_rdma)),
     ];
-    if let Err(e) = ready_call_parse(SEND, proto, body, &mut channel).await {
-        log::error!("gRPC error: {e}");
+    if let Err(e) = ready_call_parse(SEND, proto, body, &mut channel, &label).await {
+        log::error!(
+            "gRPC error{suffix}: {e}",
+            suffix = if label.is_empty() {
+                String::new()
+            } else {
+                format!(" {label}")
+            }
+        );
         let _ = copy_join.join().await;
         return (TRANSFER_FAILED_SENTINEL, 0);
     }
@@ -776,7 +784,7 @@ pub(crate) async fn list_entries(
                 (3, repeated_ints(&mut suffix_sizes)),
                 (4, repeated_ints(&mut sizes)),
             ];
-            ready_call_parse(LIST, proto, body, &mut channel).await?;
+            ready_call_parse(LIST, proto, body, &mut channel, "").await?;
 
             if sizes.len() != suffix_sizes.len() {
                 return Err(Status::invalid_argument(format!(
@@ -944,6 +952,7 @@ pub fn maybe_load_fully_replicated_tensors<'py>(
             vec![0],
             vec![size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         )));
@@ -959,6 +968,7 @@ pub fn maybe_load_fully_replicated_tensors<'py>(
             vec![0],
             vec![checksums_size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         )));
@@ -1205,6 +1215,7 @@ pub fn load_tensor_no_resharding<'py>(
             vec![0; n],
             vec![shard_size; n],
             slice,
+            format!("rank={i}"),
             #[cfg(target_os = "linux")]
             (devicez[i].clone(), contexts.clone(), mrx[i].clone()),
         )));
@@ -1412,6 +1423,7 @@ pub fn load_tensor_into(
                                     vec![file_offset],
                                     vec![min_count],
                                     b,
+                                    format!("shard={shard_idx}"),
                                     #[cfg(target_os = "linux")]
                                     (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
                                 )));

@@ -680,6 +680,7 @@ async fn download_chunk(
         vec![offset],
         vec![size],
         buf_ref,
+        String::new(),
         #[cfg(target_os = "linux")]
         (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
     )

@@ -634,6 +634,14 @@ def _prep_spec(
     }
 
 
+def _emb_table_geometry(trainer: RecsysTrainer) -> tuple[int, int]:
+    emb_table = getattr(trainer.state_shape, "emb_table", None)
+    if emb_table is not None:
+        return int(emb_table.x.shape[0]), int(trainer.mesh.shape["expert"])
+    ep = max(int(getattr(trainer, "training_ep", 0) or 0), 1)
+    return int(trainer.dataset.input_vocab_size), ep
+
+
 def _build_manifest(
     trainer: RecsysTrainer,
     export_cfg: Any,
@@ -651,8 +659,7 @@ def _build_manifest(
     model_config = export_cfg.model_config
     dataset = export_cfg.dataset
 
-    ep = int(trainer.mesh.shape["expert"])
-    emb_rows = int(trainer.state_shape.emb_table.x.shape[0])
+    emb_rows, ep = _emb_table_geometry(trainer)
     emb_rows_padded = -(-emb_rows // ep) * ep
 
     return {

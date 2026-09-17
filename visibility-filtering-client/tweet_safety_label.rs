@@ -379,6 +379,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl VisibilityFilteringService for TestVisibilityFilteringService {
+        async fn evaluate_tweets(
+            &self,
+            _: Request<vf_pb::EvaluateTweetsRequest>,
+        ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
         async fn filter_tweets(
             &self,
             _request: Request<vf_pb::VisibilityFilterRequest>,

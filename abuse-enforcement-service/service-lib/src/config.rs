@@ -63,7 +63,11 @@ pub struct Config {
     #[arg(long, default_value_t = 64, env = "KAFKA_MAX_IN_FLIGHT")]
     pub kafka_max_in_flight: usize,
 
-    #[arg(long, default_value = "coredata", env = "KAFKA_PRODUCER_MTLS_CLUSTER")]
+    #[arg(
+        long,
+        default_value = "mltraining",
+        env = "KAFKA_PRODUCER_MTLS_CLUSTER"
+    )]
     pub kafka_producer_mtls_cluster: String,
 
     #[arg(long, default_value = "atla", env = "KAFKA_PRODUCER_MTLS_ZONE")]
@@ -252,10 +256,10 @@ mod tests {
     }
 
     #[test]
-    fn coredata_producer_defaults_use_mtls() {
+    fn mltraining_producer_defaults_use_mtls() {
         let config = Config::parse_from(["xai-abuse-enforcement-service"]);
 
-        assert_eq!(config.kafka_producer_mtls_cluster, "coredata");
+        assert_eq!(config.kafka_producer_mtls_cluster, "mltraining");
         assert_eq!(config.kafka_producer_mtls_zone, "atla");
     }
 }

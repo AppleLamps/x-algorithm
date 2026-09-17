@@ -1366,6 +1366,8 @@ class PhoenixDataset(Dataset):
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -1400,7 +1402,7 @@ class PhoenixDataset(Dataset):
             and self.candidate_negative_filter != CandidateNegativeFilter.NONE
             else None,
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
-            sample_source=np.zeros((batch_size, 1), dtype=np.bool_),
+            sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
         return batch
 
@@ -1497,6 +1499,8 @@ class PhoenixToyDataset(PhoenixDataset):
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
                 trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,

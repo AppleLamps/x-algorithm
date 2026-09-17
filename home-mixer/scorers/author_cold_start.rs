@@ -227,15 +227,8 @@ fn cold_start_corpus_eligible(arm: ViewerArm, c: &PostCandidate, corpus: AuthorC
     match arm {
         ViewerArm::Holdout => !is_phoenix_moe(c),
         ViewerArm::Control => corpus == AuthorCorpus::Control && !is_phoenix_moe(c),
-        ViewerArm::Treatment => corpus == AuthorCorpus::Treatment && is_phoenix_moe(c),
+        ViewerArm::Treatment => corpus == AuthorCorpus::Treatment,
     }
-}
-
-fn cold_start_freshness_eligible(arm: ViewerArm, c: &PostCandidate, max_age: Duration) -> bool {
-    if arm != ViewerArm::Treatment {
-        return true;
-    }
-    duration_since_creation_opt(c.tweet_id).is_some_and(|age| age <= max_age)
 }
 
 fn pick_by_score(eligible: &[usize], scores: &[f64]) -> Option<usize> {
@@ -304,7 +297,8 @@ fn apply_cold_start(
         .filter(|(i, c)| {
             cold_start_base_eligible(c, params.follower_cap)
                 && cold_start_corpus_eligible(arm, c, corpus[*i])
-                && cold_start_freshness_eligible(arm, c, params.max_post_age)
+                && duration_since_creation_opt(c.tweet_id)
+                    .is_some_and(|age| age <= params.max_post_age)
                 && positions[*i] < max_cold_start_slot
                 && c.view_count_on_home
                     .is_some_and(|imp| imp < params.impression_threshold)
@@ -628,7 +622,7 @@ rust_home_mixer:
     }
 
     #[test]
-    fn treatment_viewer_cold_starts_treatment_moe_only() {
+    fn treatment_viewer_cold_starts_treatment_authors_only() {
         let author_cold_start = cold_start_with_arms(vec![1, 2], vec![3]);
         let candidates = vec![
             moe_candidate(1, minutes(10), 3),
@@ -640,13 +634,13 @@ rust_home_mixer:
             &candidates,
             &[50.0, 80.0, 90.0],
         );
-        assert_eq!(result[0], 90.0);
-        assert_eq!(result[1], 80.0);
+        assert_eq!(result[0], 50.0);
+        assert_eq!(result[1], 90.0);
         assert_eq!(result[2], 90.0);
     }
 
     #[test]
-    fn treatment_skips_post_older_than_max_post_age() {
+    fn skips_post_older_than_max_post_age() {
         let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
         let candidates = vec![
             moe_candidate(1, minutes(180), 3),
@@ -658,21 +652,6 @@ rust_home_mixer:
             &[10.0, 90.0],
         );
         assert_eq!(result, vec![10.0, 90.0]);
-    }
-
-    #[test]
-    fn control_ignores_max_post_age() {
-        let author_cold_start = cold_start_with_arms(vec![], vec![1]);
-        let candidates = vec![
-            cold_start_candidate(1, minutes(180), 3),
-            cold_start_candidate(2, minutes(30), 1000),
-        ];
-        let result = author_cold_start.apply(
-            &query_with_max_post_age(false, 7200),
-            &candidates,
-            &[10.0, 90.0],
-        );
-        assert_eq!(result, vec![90.0, 90.0]);
     }
 
     #[test]
@@ -705,28 +684,6 @@ rust_home_mixer:
             moe_candidate_with_favs(2, minutes(20), 3, 0),
         ];
         let result = author_cold_start.apply(&ts_query(true, 0), &candidates, &[10.0, 90.0]);
-        assert_eq!(result, vec![10.0, 90.0]);
-    }
-
-    #[test]
-    fn treatment_ts_among_top_k_picks_highest_score() {
-        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
-        let candidates = vec![
-            moe_candidate_with_favs(1, minutes(10), 0, 0),
-            moe_candidate_with_favs(2, minutes(20), 0, 0),
-        ];
-        let result = author_cold_start.apply(&ts_query(true, 10), &candidates, &[10.0, 90.0]);
-        assert_eq!(result, vec![10.0, 90.0]);
-    }
-
-    #[test]
-    fn control_ts_among_top_k_picks_highest_score() {
-        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
-        let candidates = vec![
-            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
-            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
-        ];
-        let result = author_cold_start.apply(&ts_query(false, 10), &candidates, &[10.0, 90.0]);
         assert_eq!(result, vec![10.0, 90.0]);
     }
 
