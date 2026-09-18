@@ -1,9 +1,9 @@
 use crate::hydration::{HydrationOutput, HydrationPipeline, HydrationRequest};
-use crate::models::{RawCandidate, TweetId, VfAction};
+use crate::models::{RawCandidate, TweetId};
 use crate::rules::metrics as ft_metrics;
-use crate::rules::{Policies, SafetyLevel, Verdict};
+use crate::rules::{RuleEngine, SafetyLevel, Verdict};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use std::time::Instant;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct FilterRequest {
@@ -19,31 +19,25 @@ pub struct FilterOutcome {
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
 }
 
-pub struct FilterSummary {
-    pub tweet_count: usize,
-    pub drop_count: usize,
-    pub unresolved_author_count: usize,
-}
-
 pub struct FilterResponse {
     pub outcomes: Vec<FilterOutcome>,
-    pub summary: FilterSummary,
 }
 
 pub struct FilterTweets {
     hydration_pipeline: HydrationPipeline,
-    policies: Policies,
+    rule_engine: RuleEngine,
 }
 
 impl FilterTweets {
-    pub(crate) fn new(hydration_pipeline: HydrationPipeline, policies: Policies) -> Self {
+    pub(crate) fn new(hydration_pipeline: HydrationPipeline, rule_engine: RuleEngine) -> Self {
         Self {
             hydration_pipeline,
-            policies,
+            rule_engine,
         }
     }
 
     pub async fn run(&self, request: FilterRequest) -> FilterResponse {
+        let started = Instant::now();
         let hydration = self
             .hydration_pipeline
             .hydrate(HydrationRequest::new(
@@ -53,25 +47,19 @@ impl FilterTweets {
                 request.safety_level,
             ))
             .await;
+        let hydrated_at = Instant::now();
+        ft_metrics::record_phase("hydration", hydrated_at - started);
         let HydrationOutput {
             viewer_features,
             candidates: hydrated_candidates,
             safety_labels,
         } = hydration;
-        let unresolved_author_count = request.candidates.len() - hydrated_candidates.len();
-        if unresolved_author_count > 0 {
-            info!(
-                count = unresolved_author_count,
-                "Tweets with unresolved author_id"
-            );
-        }
-
         let evaluated: HashMap<TweetId, Verdict> = hydrated_candidates
             .iter()
             .map(|candidate| {
                 (
                     TweetId(candidate.tweet_id),
-                    self.policies
+                    self.rule_engine
                         .evaluate(request.safety_level, &viewer_features, candidate),
                 )
             })
@@ -85,18 +73,12 @@ impl FilterTweets {
                     .get(&candidate.tweet_id)
                     .cloned()
                     .unwrap_or_else(Verdict::unresolved_author);
-                debug!(
-                    viewer_id = request.viewer_id,
-                    tweet_id = candidate.tweet_id.0,
-                    action = ?verdict.action,
-                    rule = ?verdict.decided_by,
-                    safety_level = ?request.safety_level,
-                    "VF verdict"
-                );
                 FilterOutcome {
                     tweet_id: candidate.tweet_id,
                     verdict,
-                    safety_labels: safety_labels.get(&candidate.tweet_id).cloned(),
+                    safety_labels: safety_labels
+                        .get(&candidate.tweet_id)
+                        .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
                 }
             })
             .collect();
@@ -105,25 +87,16 @@ impl FilterTweets {
             request.safety_level,
             outcomes.iter().map(|outcome| &outcome.verdict),
         );
+        ft_metrics::record_phase("post_hydration", hydrated_at.elapsed());
 
-        FilterResponse {
-            summary: FilterSummary {
-                tweet_count: outcomes.len(),
-                drop_count: outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome.verdict.action, VfAction::Drop(_)))
-                    .count(),
-                unresolved_author_count,
-            },
-            outcomes,
-        }
+        FilterResponse { outcomes }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::clients::socialgraph_client::MockSocialgraphClient;
+    use crate::clients::socialgraph_client::FakeSocialgraphClient;
     use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
     use crate::safety_label_source::SafetyLabelSource;
@@ -169,11 +142,15 @@ mod tests {
         }
     }
 
-    fn filter_tweets() -> FilterTweets {
+    pub(crate) fn filter_tweets() -> FilterTweets {
+        filter_tweets_with_gizmoduck(Arc::new(MockGizmoduckClient::default()))
+    }
+
+    pub(crate) fn filter_tweets_with_gizmoduck(
+        gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
+    ) -> FilterTweets {
         let tes: Arc<dyn TESClient + Send + Sync> = Arc::new(MockTESClient::default());
-        let gizmoduck: Arc<dyn GizmoduckClient + Send + Sync> =
-            Arc::new(MockGizmoduckClient::default());
-        let socialgraph = Arc::new(MockSocialgraphClient::default());
+        let socialgraph = Arc::new(FakeSocialgraphClient);
         let twemcache = Arc::new(FakeTwemcache);
         let manhattan = Arc::new(FakeManhattan);
         let labels = Arc::new(SafetyLabelSource::new(Arc::new(RemoteSource::new(
@@ -181,17 +158,17 @@ mod tests {
         ))));
 
         FilterTweets::new(
-            HydrationPipeline::new(
-                tes,
-                gizmoduck,
-                socialgraph,
-                labels,
-                crate::hydration::FallbackCacheMode::Disabled,
-                crate::hydration::FallbackCacheMode::Disabled,
-            ),
-            Policies::new(),
+            HydrationPipeline::new(tes, gizmoduck, socialgraph, labels, None, None),
+            RuleEngine::for_tests(),
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::test_support::filter_tweets;
+    use crate::models::VfAction;
 
     fn candidate(tweet_id: u64, author_id: Option<u64>) -> RawCandidate {
         RawCandidate {
@@ -239,9 +216,6 @@ mod tests {
             response.outcomes[2].verdict.action,
             VfAction::Allow
         ));
-        assert_eq!(response.summary.tweet_count, 3);
-        assert_eq!(response.summary.drop_count, 1);
-        assert_eq!(response.summary.unresolved_author_count, 1);
         assert!(response
             .outcomes
             .iter()

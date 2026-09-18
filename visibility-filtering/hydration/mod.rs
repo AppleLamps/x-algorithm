@@ -19,18 +19,20 @@ use crate::rules::SafetyLevel;
 use crate::safety_label_source::SafetyLabelSource;
 use batch::TweetHydrationBatch;
 use exclusive_content_hydrator::ExclusiveContentHydrator;
-pub(crate) use fallback_cache::FallbackCacheMode;
+use fallback_cache::FallbackCache;
 use gizmoduck_hydrator::GizmoduckAuthorHydrator;
 use safety_label_hydrator::{SafetyLabelHydration, SafetyLabelHydrator};
 use socialgraph_hydrator::SocialgraphHydrator;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
-use tes_hydrator::TesHydrator;
+use std::time::Duration;
+use tes_hydrator::{AuthorIdFallbackCache, TesHydrator};
 use viewer_hydrator::ViewerHydrator;
 use xai_core_entities::gizmoduck_client::GizmoduckClient;
 use xai_core_entities::tweet_entity_service_client::TESClient;
 use xai_visibility_filtering_proto as vf_pb;
+
+pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_millis(390);
 
 pub(crate) struct HydrationRequest<'a> {
     viewer_id: Option<u64>,
@@ -126,7 +128,7 @@ pub(crate) struct HydrationPipeline {
 pub(crate) struct HydrationOutput {
     pub(crate) viewer_features: ViewerFeatures,
     pub(crate) candidates: Vec<HydratedTweetCandidate>,
-    pub(crate) safety_labels: HashMap<TweetId, vf_pb::SafetyLabelMap>,
+    pub(crate) safety_labels: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
 }
 
 impl HydrationPipeline {
@@ -135,17 +137,17 @@ impl HydrationPipeline {
         gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
         socialgraph_client: Arc<dyn SocialgraphClient + Send + Sync>,
         safety_label_source: Arc<SafetyLabelSource>,
-        fallback_cache_mode: FallbackCacheMode,
-        media_fallback_cache_mode: FallbackCacheMode,
+        fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
+        author_id_fallback_cache: Option<AuthorIdFallbackCache>,
     ) -> Self {
         Self {
             viewer_hydrator: ViewerHydrator {
                 gizmoduck_client: gizmoduck_client.clone(),
             },
-            tes_hydrator: TesHydrator::new(tes_client.clone(), media_fallback_cache_mode),
+            tes_hydrator: TesHydrator::new(tes_client.clone(), author_id_fallback_cache),
             gizmoduck_author_hydrator: GizmoduckAuthorHydrator::new(
                 GizmoduckLookup::new(gizmoduck_client),
-                fallback_cache_mode,
+                fallback_cache,
             ),
             socialgraph_hydrator: SocialgraphHydrator {
                 sg_client: socialgraph_client.clone(),
@@ -172,102 +174,33 @@ impl HydrationPipeline {
             .viewer_hydrator
             .hydrate(viewer_id, country_code, safety_level);
         let candidate_hydration = async {
-            let start = Instant::now();
             let tweet_ids: Vec<TweetId> = raw_candidates.iter().map(|c| c.tweet_id).collect();
             let independent_group = async {
                 tokio::join!(
-                    async {
-                        let hydrator_start = Instant::now();
-                        let result = self
-                            .safety_label_hydrator
-                            .hydrate(&tweet_ids, safety_level)
-                            .await;
-                        tracing::info!(
-                            hydrator = "SafetyLabelHydrator",
-                            result_count = result.label_types.len(),
-                            latency_ms = hydrator_start.elapsed().as_millis() as u64,
-                            "Hydrator completed"
-                        );
-                        result
-                    },
-                    async {
-                        let hydrator_start = Instant::now();
-                        let result = self
-                            .tes_hydrator
-                            .hydrate_tweets(&tweet_ids, safety_level)
-                            .await;
-                        tracing::info!(
-                            hydrator = "TesHydrator.tweets",
-                            result_count = result.media.len(),
-                            failed_entries = result.failed_entries(),
-                            latency_ms = hydrator_start.elapsed().as_millis() as u64,
-                            "Hydrator completed"
-                        );
-                        result
-                    },
-                    async {
-                        let hydrator_start = Instant::now();
-                        let result = self
-                            .exclusive_content_hydrator
-                            .hydrate(&tweet_ids, viewer, safety_level)
-                            .await;
-                        tracing::info!(
-                            hydrator = "ExclusiveContentHydrator",
-                            result_count = result.len(),
-                            latency_ms = hydrator_start.elapsed().as_millis() as u64,
-                            "Hydrator completed"
-                        );
-                        result
-                    },
+                    self.safety_label_hydrator.hydrate(&tweet_ids, safety_level),
+                    self.tes_hydrator.hydrate_tweets(&tweet_ids, safety_level),
+                    self.exclusive_content_hydrator
+                        .hydrate(&tweet_ids, viewer, safety_level),
                 )
             };
 
             let author_hop = async {
-                let pure_core_start = Instant::now();
-                let core_datas = self
+                let pure_core = self
                     .tes_hydrator
                     .fetch_pure_core(&tweet_ids, safety_level)
                     .await;
-                tracing::info!(
-                    hydrator = "TesHydrator.pure_core",
-                    result_count = core_datas.len(),
-                    latency_ms = pure_core_start.elapsed().as_millis() as u64,
-                    "Hydrator completed"
+                let candidates = resolve_candidates(
+                    raw_candidates,
+                    &pure_core.core,
+                    &pure_core.recovered_authors,
                 );
-                let candidates = resolve_candidates(raw_candidates, &core_datas);
                 let (author_features, relationships) = tokio::join!(
-                    async {
-                        let hydrator_start = Instant::now();
-                        let result = self
-                            .gizmoduck_author_hydrator
-                            .hydrate(&candidates, safety_level)
-                            .await;
-                        tracing::info!(
-                            hydrator = "GizmoduckAuthorHydrator",
-                            result_count = result.len(),
-                            failed_count = result.failed_count(),
-                            latency_ms = hydrator_start.elapsed().as_millis() as u64,
-                            "Hydrator completed"
-                        );
-                        result
-                    },
-                    async {
-                        let hydrator_start = Instant::now();
-                        let result = self
-                            .socialgraph_hydrator
-                            .hydrate(&candidates, viewer, safety_level)
-                            .await;
-                        tracing::info!(
-                            hydrator = "SocialgraphHydrator",
-                            result_count = result.len(),
-                            failed_count = result.failed_count(),
-                            latency_ms = hydrator_start.elapsed().as_millis() as u64,
-                            "Hydrator completed"
-                        );
-                        result
-                    },
+                    self.gizmoduck_author_hydrator
+                        .hydrate(&candidates, safety_level),
+                    self.socialgraph_hydrator
+                        .hydrate(&candidates, viewer, safety_level),
                 );
-                (core_datas, candidates, author_features, relationships)
+                (pure_core.core, candidates, author_features, relationships)
             };
 
             let (
@@ -295,11 +228,6 @@ impl HydrationPipeline {
             };
             let hydrated_candidates = features.assemble(&candidates);
 
-            tracing::info!(
-                candidate_count = hydrated_candidates.len(),
-                total_latency_ms = start.elapsed().as_millis() as u64,
-                "All hydrators completed"
-            );
             (hydrated_candidates, label_response)
         };
 
@@ -332,7 +260,8 @@ mod tests {
 
     #[test]
     fn assemble_handles_mismatched_cardinality_without_mispairing() {
-        let resolved = resolve_candidate(&raw(2, None), &core(2, 200)).expect("tweet 2 resolves");
+        let resolved = resolve_candidate(&raw(2, None), &core(2, 200), &HashMap::new())
+            .expect("tweet 2 resolves");
         let candidates = vec![resolved];
 
         let results = CandidateFeatures {
@@ -342,7 +271,7 @@ mod tests {
                     TweetId(2),
                     TweetFeatures {
                         core: crate::models::CoreFeature {
-                            text: "two".to_string(),
+                            source_tweet_id: Some(2),
                             ..Default::default()
                         },
                         ..Default::default()
@@ -382,7 +311,7 @@ mod tests {
         let c = &assembled[0];
         assert_eq!(c.tweet_id, 2);
         assert_eq!(c.author_id, 200);
-        assert_eq!(c.tweet_features.core.text, "two");
+        assert_eq!(c.tweet_features.core.source_tweet_id, Some(2));
         assert!(c.author_features.is_suspended);
         assert!(c.relationship.viewer_follows_author);
     }
@@ -399,7 +328,12 @@ mod tests {
         let candidates: Vec<_> = [(1, 10), (2, 10), (3, 20)]
             .into_iter()
             .map(|(tweet_id, author_id)| {
-                resolve_candidate(&raw(tweet_id, Some(author_id)), &HashMap::new()).unwrap()
+                resolve_candidate(
+                    &raw(tweet_id, Some(author_id)),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .unwrap()
             })
             .collect();
 
