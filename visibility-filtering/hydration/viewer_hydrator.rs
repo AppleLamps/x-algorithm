@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
 
-const CLIENT_TIMEOUT: Duration = Duration::from_millis(150);
+const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 
 const VIEWER_QUERY_FIELDS: [QueryFields; 2] = [QueryFields::ACCOUNT, QueryFields::EXTENDED_PROFILE];
 

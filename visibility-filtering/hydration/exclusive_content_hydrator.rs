@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use xai_core_entities::tweet_entity_service_client::TESClient;
 
-const CLIENT_TIMEOUT: Duration = Duration::from_millis(150);
+const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 const CLIENT: &str = "exclusive_content";
 
 pub struct ExclusiveContentHydrator {
