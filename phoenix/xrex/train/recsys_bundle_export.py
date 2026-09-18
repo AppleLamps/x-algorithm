@@ -28,6 +28,70 @@ BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_DIR = "export"
 MANIFEST_NAME = f"{BUNDLE_DIR}/MANIFEST.json"
 
+REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
+    {
+        "user_hashes",
+        "user_ip_hashes",
+        "user_categorical_features",
+        "user_bool_features",
+        "user_float_features",
+        "user_int64_features",
+        "user_installed_apps_multihot",
+        "user_conversion_history_hashes",
+        "history_seq.post_hashes",
+        "history_seq.auth_hashes",
+        "history_seq.product_surface",
+        "history_seq.actions",
+        "history_seq.continuous_actions",
+        "history_seq.impr_ts",
+        "history_seq.post_creation_ts_sec",
+        "history_seq.categorical_features",
+        "history_seq.bool_features",
+        "history_seq.float_features",
+        "history_seq.int64_features",
+        "history_seq.post_sids",
+        "candidate_seq.post_hashes",
+        "candidate_seq.auth_hashes",
+        "candidate_seq.product_surface",
+        "candidate_seq.impr_ts",
+        "candidate_seq.post_creation_ts_sec",
+        "candidate_seq.categorical_features",
+        "candidate_seq.bool_features",
+        "candidate_seq.float_features",
+        "candidate_seq.int64_features",
+        "candidate_seq.embedding",
+        "candidate_seq.search_query_embeddings",
+        "candidate_seq.line_item_ids",
+        "candidate_seq.campaign_ids",
+        "candidate_seq.funding_instrument_ids",
+        "candidate_seq.conversion_dense_features",
+        "candidate_seq.account_hashes",
+        "candidate_seq.post_sids",
+    }
+)
+
+
+def _template_fill(key: str, value: Any) -> bool | int | float:
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return 0
+    first = arr.reshape(-1)[0]
+    if not np.all(arr == first):
+        raise ValueError(
+            f"batch key {key!r} is not in REQUEST_BATCH_KEYS but its example_data template "
+            "is not constant; register it as a request feature or make the template uniform"
+        )
+    if arr.dtype == np.bool_:
+        return bool(first)
+    if np.issubdtype(arr.dtype, np.integer):
+        return int(first)
+    if np.issubdtype(arr.dtype, np.floating):
+        fill = float(first)
+        if not np.isfinite(fill):
+            raise ValueError(f"batch key {key!r}: non-finite template fill {fill}")
+        return fill
+    raise ValueError(f"batch key {key!r}: unsupported template dtype {arr.dtype}")
+
 
 def restamp_manifest(data: bytes) -> bytes:
     manifest = json.loads(data)
@@ -206,7 +270,7 @@ def _make_export_config(trainer: RecsysTrainer, history_seq_len: int, candidate_
     return export_cfg
 
 
-def _batch_avals(export_cfg: Any, bs: int, *, packed: bool) -> Any:
+def _batch_template(export_cfg: Any, bs: int, *, packed: bool) -> Any:
     model_config = export_cfg.model_config
     batch = export_cfg.dataset.example_data(bs)
 
@@ -221,8 +285,15 @@ def _batch_avals(export_cfg: Any, bs: int, *, packed: bool) -> Any:
             rng=None,
             block_size=export_cfg._seqpack_block_size,
         )
+    return batch
 
-    batch = _to_shape_dtype_struct(batch)
+
+def _batch_avals(export_cfg: Any, bs: int, *, packed: bool, template: Any = None) -> Any:
+    model_config = export_cfg.model_config
+    if template is None:
+        template = _batch_template(export_cfg, bs, packed=packed)
+
+    batch = _to_shape_dtype_struct(template)
 
     if model_config.multimodal_embedding_type is not None:
         cand_post = batch["candidate_seq"]["post_hashes"]
@@ -374,10 +445,17 @@ def _scan_custom_call_targets(lowered_text: str) -> list[str]:
 
 
 def _input_spec(
-    params_avals: Any, rng_aval: Any, batch_avals: Any, merged_aval: Any
+    params_avals: Any,
+    rng_aval: Any,
+    batch_avals: Any,
+    merged_aval: Any,
+    batch_template: Any,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
+    template_leaves = {
+        keystr(path): leaf for path, leaf in jax.tree_util.tree_flatten_with_path(batch_template)[0]
+    }
     spec: list[dict[str, Any]] = []
 
     param_leaves = jax.tree.leaves(params_avals)
@@ -393,8 +471,26 @@ def _input_spec(
 
     for path, leaf in jax.tree_util.tree_flatten_with_path(batch_avals)[0]:
         key = keystr(path)
-        kind = "packing_layout" if key.startswith("packing_layout.") else "batch"
-        spec.append({"kind": kind, "key": key, **_aval_entry(leaf)})
+        if key.startswith("packing_layout."):
+            spec.append({"kind": "packing_layout", "key": key, **_aval_entry(leaf)})
+        elif key in REQUEST_BATCH_KEYS:
+            spec.append({"kind": "batch", "key": key, "source": "request", **_aval_entry(leaf)})
+        else:
+            if key not in template_leaves:
+                raise ValueError(
+                    f"batch key {key!r} is not in REQUEST_BATCH_KEYS and has no example_data "
+                    "template value; register it as a request feature"
+                )
+            fill = _template_fill(key, template_leaves[key])
+            spec.append(
+                {
+                    "kind": "batch",
+                    "key": key,
+                    "source": "template",
+                    "fill": fill,
+                    **_aval_entry(leaf),
+                }
+            )
 
     spec.append(
         {"kind": "merged_embeddings", "key": "merged_embeddings", **_aval_entry(merged_aval)}
@@ -477,7 +573,8 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
 
     for bs in buckets:
         start = time.perf_counter()
-        batch_avals = _batch_avals(export_cfg, bs, packed=packed)
+        batch_template = _batch_template(export_cfg, bs, packed=packed)
+        batch_avals = _batch_avals(export_cfg, bs, packed=packed, template=batch_template)
         if packed:
             embedding_slices, packed_geometry = _packed_embedding_slices(export_cfg, batch_avals)
             merged_batch = packed_geometry.merged_batch
@@ -504,7 +601,7 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
                 ],
             )(*args)
 
-        spec = _input_spec(params_avals, rng_aval, batch_avals, merged_aval)
+        spec = _input_spec(params_avals, rng_aval, batch_avals, merged_aval, batch_template)
         if len(spec) != len(exported.in_avals):
             raise AssertionError(
                 f"input spec mismatch for bs={bs}: {len(spec)} != {len(exported.in_avals)}"

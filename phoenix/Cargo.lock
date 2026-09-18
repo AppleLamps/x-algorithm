@@ -4285,7 +4285,8 @@ dependencies = [
 [[package]]
 name = "thrift"
 version = "0.24.0"
-source = "git+https://github.com/apache/thrift.git?tag=v0.24.0#6d2ec95f450b4ce404afb8929ff479e68770141a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b29bdae81cc2dbc498a720e2734e08f26e388c791fca6e95464d41001913714"
 dependencies = [
  "byteorder",
  "integer-encoding",

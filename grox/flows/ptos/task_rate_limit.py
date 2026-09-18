@@ -30,6 +30,13 @@ class TaskRateLimitSafetyPtosAdultContentLeadingFrames(TaskTTLDedupeWithPost):
     DEDUPE_NAME = "safety ptos adult content leading frames"
 
 
+class TaskRateLimitSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(
+    TaskTTLDedupeWithPost
+):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos media injected adult infrared video spam detection"
+
+
 class TaskRateLimitSafetyPtosRealtimeWithSignals(TaskTTLDedupeWithPost):
     DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
     DEDUPE_NAME = "safety ptos realtime with signals"

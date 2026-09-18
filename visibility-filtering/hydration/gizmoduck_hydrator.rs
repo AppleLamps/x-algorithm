@@ -173,6 +173,7 @@ mod tests {
                                 },
                                 ..Default::default()
                             }),
+                            ..Default::default()
                         }))
                     } else {
                         Err(anyhow::anyhow!("gizmoduck unavailable"))
@@ -306,6 +307,7 @@ mod tests {
                 },
                 ..Default::default()
             }),
+            ..Default::default()
         }
     }
 

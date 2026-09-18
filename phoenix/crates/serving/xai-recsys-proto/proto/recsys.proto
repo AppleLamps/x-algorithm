@@ -62,6 +62,19 @@ message UserContext {
   int32 user_muters_count = 17;
 }
 
+message EngagementCountRow {
+  int32 action = 1;
+  repeated uint32 counts = 2;
+}
+
+message EngagementCounts {
+  bool present = 1;
+  repeated uint32 window_secs = 2;
+  repeated EngagementCountRow rows = 3;
+  int64 updated_at_ms = 4;
+  int64 window_end_ms = 5;
+}
+
 message ConversionHistoryContext {
   float hist_user_total_convs = 1;
   float hist_user_unique_advs = 2;
@@ -122,6 +135,7 @@ message PredictNextActionsRequest {
   bool returnLogitsList = 22;
 
   repeated PurchaseValueBaseline purchase_value_baselines = 23;
+  EngagementCounts user_ads_engagement_counts = 24;
 }
 
 message PurchaseValueBaseline {
@@ -1259,6 +1273,12 @@ message TweetInfo {
   ScoreInfo scoreInfo = 35;
   ContentFeatures contentFeatures = 36;
   ContentFeatures quotedContentFeatures = 37;
+  SearchLexicalMatch searchLexicalMatch = 38;
+}
+
+message SearchLexicalMatch {
+  float matchedWordFraction = 1;
+  bool exactPhrase = 2;
 }
 
 message ContentFeatures {
@@ -1451,6 +1471,8 @@ message AdInfo {
   repeated int64 product_keys = 21;
 
   DpaProductInfo dpa_product_info = 22;
+
+  EngagementCounts engagement_counts = 23;
 }
 
 message UserAdActionMeta {

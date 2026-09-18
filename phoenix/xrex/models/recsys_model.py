@@ -21,13 +21,10 @@ from xai_configlib import configclass as configclass
 from xai_proto import recsys_pb2
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
-    CLICK_CONDITIONED_ACTION_INDICES,
     MACT_IN_APP_LOSS_ACTION_INDICES,
     NEGATIVE_FEEDBACK_HEAD_INDICES,
     PURCHASE_VALUE_ACTION_INDEX,
     SEARCH_RELEVANCE_ACTION_INDICES,
-    SOURCE_SPLIT_CONVERSION_HEAD_INDICES,
-    VIEW_THROUGH_ACTION_INDICES,
     action_type_map,
     engagement_to_ids,
 )
@@ -41,12 +38,19 @@ from xrex.data.recsys.feature_config import (
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch
 from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
+from xrex.models.ads_head_masking import (
+    EARLY_RELABEL_STREAM_ID,
+    FRESH_STREAM_ID,
+    ads_head_masking_factor,
+    ads_late_window_no_early_slice,
+)
 from xrex.models.layers import Linear, get_parameter
 from xrex.models.loss_recsys import (
     binary_threshold_loss_compute,
     continuous_loss_compute,
     multihot_loss_compute,
     purchase_value_loss_compute,
+    purchase_value_smoothed_stats,
     purchase_value_valid_mask,
     tweedie_loss_compute,
 )
@@ -568,6 +572,7 @@ class RecsysAggregatedModelConfig(Config):
 
     purchase_value_loss_weight: float = 0.0
     purchase_value_huber_delta: float = 1.0
+    purchase_value_smoothing_windows: tuple[int, ...] = (1 << 28, 1 << 30)
 
     @property
     def purchase_value_enabled(self) -> bool:
@@ -596,6 +601,10 @@ class RecsysAggregatedModelConfig(Config):
             lc.action_index == PURCHASE_VALUE_ACTION_INDEX for lc in self.continuous_action_losses
         ):
             raise ValueError("purchase value slot cannot also use a generic continuous loss")
+        if not self.purchase_value_smoothing_windows or any(
+            w <= 0 for w in self.purchase_value_smoothing_windows
+        ):
+            raise ValueError("purchase_value_smoothing_windows must be positive sample counts")
 
     continuous_action_hidden_dim: int = 64
 
@@ -659,11 +668,7 @@ class RecsysAggregatedModelConfig(Config):
 
     mask_neg_feedback_on_negatives: bool = True
 
-    condition_conversion_on_click: bool = False
-
-    train_view_through_heads: bool = False
-
-    split_head_training_by_source: bool = False
+    ads_head_masking: bool = False
 
     mact_in_app_loss_weight: float = 1.0
 
@@ -1399,10 +1404,9 @@ def build_metric_masks(
     dpa_product_key: jax.Array | None = None,
     sample_source: jax.Array | None = None,
     *,
-    condition_conversion_on_click: bool = False,
+    ads_head_masking: bool = False,
     condition_search_relevance_on_prompt: bool = False,
     enable_platform_metrics: bool = False,
-    split_head_training_by_source: bool = False,
     metric_mask_keys: list[str] | None = None,
 ) -> dict[str, jax.Array]:
     promoted_mask = mask * (promoted_ids != 0) if promoted_ids is not None else jnp.zeros_like(mask)
@@ -1487,24 +1491,23 @@ def build_metric_masks(
     masks["dpa"] = mask * dpa_mask
     masks["non_negative_dpa"] = non_negative_mask * dpa_mask
 
-    if condition_conversion_on_click:
+    if ads_head_masking:
         click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
         masks["clicked"] = mask * click_mask
         masks["non_negative_clicked"] = mask * (1 - negative_sample_mask) * click_mask
-
-    if split_head_training_by_source:
-        assert condition_conversion_on_click, (
-            "split_head_training_by_source metric slices require condition_conversion_on_click"
-        )
-        delayed = (
-            jnp.zeros_like(mask)
-            if sample_source is None
-            else (sample_source > 0).astype(mask.dtype)
-        )
+        if sample_source is None:
+            fresh = jnp.ones_like(mask)
+            early = jnp.zeros_like(mask)
+        else:
+            fresh = (sample_source == FRESH_STREAM_ID).astype(mask.dtype)
+            early = (sample_source == EARLY_RELABEL_STREAM_ID).astype(mask.dtype)
         click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
-        masks["fresh"] = mask * (1 - delayed)
-        masks["delayed_clicked"] = mask * delayed * click_mask
-        masks["delayed_non_clicked"] = mask * delayed * (1 - click_mask)
+        masks["fresh"] = mask * fresh
+        masks["delayed_clicked"] = mask * early * click_mask
+        masks["delayed_non_clicked"] = mask * early * (1 - click_mask)
+        masks["late_split_no_early"] = ads_late_window_no_early_slice(
+            mask, raw_targets, click_mask, sample_source
+        )
         masks["fresh_home_website_clicks"] = (
             masks["fresh"] * home_timeline_mask * website_clicks_objective
         )
@@ -1733,10 +1736,9 @@ class RecsysAggregatedModel(hk.Module):
             no_history_mask,
             dpa_product_key,
             sample_source,
-            condition_conversion_on_click=self.config.condition_conversion_on_click,
+            ads_head_masking=self.config.ads_head_masking,
             condition_search_relevance_on_prompt=self.config.condition_search_relevance_on_prompt,
             enable_platform_metrics=self.config.enable_platform_metrics,
-            split_head_training_by_source=self.config.split_head_training_by_source,
             metric_mask_keys=self.config.metric_mask_keys,
         )
 
@@ -3072,11 +3074,10 @@ class RecsysAggregatedModel(hk.Module):
             source_id = cast_jax(sample_source).astype(jnp.float32)
             if self.config.use_seqpack:
                 source_id = jnp.repeat(source_id.squeeze(-1), packed_candidate_seq_len, axis=1)
-        if self.config.split_head_training_by_source:
+        if self.config.ads_head_masking:
             assert source_id is not None, (
-                "split_head_training_by_source=True requires the sample_source batch "
-                "field (from the sample_source column); training unsplit "
-                "silently would defeat the flag"
+                "ads_head_masking requires the sample_source batch field (from the "
+                "sample_source column); training unsplit silently would defeat it"
             )
 
         if self.config.log_q_correction:
@@ -3285,21 +3286,9 @@ class RecsysAggregatedModel(hk.Module):
             zero_mask = negative_sample_mask[:, :, None] * neg_head_mask
             loss_mask = loss_mask * (1 - zero_mask)
 
-        if self.config.condition_conversion_on_click:
-            has_click = targets[:, :, CLICK_ACTION_INDEX]
-            no_click = 1 - has_click
-            conv_head_mask = (
-                jnp.zeros(num_actions).at[jnp.array(CLICK_CONDITIONED_ACTION_INDICES)].set(1.0)
-            )
-            conv_zero_mask = no_click[:, :, None] * conv_head_mask
-            loss_mask = loss_mask * (1 - conv_zero_mask)
-
-        vt_head_mask = jnp.zeros(num_actions).at[jnp.array(VIEW_THROUGH_ACTION_INDICES)].set(1.0)
-        if self.config.train_view_through_heads:
-            vt_zero = targets[:, :, CLICK_ACTION_INDEX][:, :, None] * vt_head_mask
-        else:
-            vt_zero = vt_head_mask
-        loss_mask = loss_mask * (1 - vt_zero)
+        if self.config.ads_head_masking:
+            assert source_id is not None
+            loss_mask = loss_mask * ads_head_masking_factor(targets, source_id, num_actions)
 
         if self.config.mact_in_app_loss_weight != 1.0:
             mact_w = (
@@ -3317,15 +3306,6 @@ class RecsysAggregatedModel(hk.Module):
             )
             search_zero_mask = no_prompt[:, :, None] * search_head_mask
             loss_mask = loss_mask * (1 - search_zero_mask)
-
-        if self.config.split_head_training_by_source and source_id is not None:
-            conv_head_split_mask = (
-                jnp.zeros(num_actions).at[jnp.array(SOURCE_SPLIT_CONVERSION_HEAD_INDICES)].set(1.0)
-            )
-            eng_head_mask = 1.0 - conv_head_split_mask
-            is_delayed = (source_id > 0).astype(loss_mask.dtype)[:, :, None]
-            loss_mask = loss_mask * (1 - is_delayed * eng_head_mask)
-            loss_mask = loss_mask * (1 - (1 - is_delayed) * conv_head_split_mask)
 
         safety_stats = safety_filter_stats(
             candidate_safety_mask,
@@ -3415,7 +3395,7 @@ class RecsysAggregatedModel(hk.Module):
             )
 
             continuous_base_mask = target_padding_mask
-            if self.config.split_head_training_by_source and source_id is not None:
+            if self.config.ads_head_masking and source_id is not None:
                 continuous_base_mask = continuous_base_mask * (
                     1 - (source_id > 0).astype(continuous_base_mask.dtype)
                 )
@@ -3584,7 +3564,22 @@ class RecsysAggregatedModel(hk.Module):
                 raw_weights=raw_weights,
             )
             continuous_action_loss_total += self.config.purchase_value_loss_weight * value_loss
+            value_sums = value_stats.pop("_purchase-value-sums")
             stats.update(value_stats)
+            slice_count = stats.get("delayed_clicked_num_tokens", jnp.zeros((), jnp.float32))
+            stats["purchase-value_delayed_clicked-ratio-valid"] = value_stats[
+                "purchase-value_delayed_clicked-valid-count"
+            ] / jnp.maximum(slice_count, 1)
+            if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:
+                smoothed_stats, value_ema = purchase_value_smoothed_stats(
+                    sums=value_sums,
+                    slice_count=slice_count,
+                    rce_ema=rce_ema,
+                    batch_size=rce_alpha[0] * smoothing_windows[0],
+                    smoothing_windows=self.config.purchase_value_smoothing_windows,
+                )
+                stats.update(smoothed_stats)
+                stats["_rce_ema"] = {**stats.get("_rce_ema", {}), **value_ema}
 
         if self.config.multimodal_embedding_type is not None and mm_emb is not None:
             if self.config.use_seqpack:

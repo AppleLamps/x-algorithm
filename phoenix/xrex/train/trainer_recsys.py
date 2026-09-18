@@ -539,6 +539,17 @@ class RecsysTrainer(Trainer):
                 batch = self.add_block_sparse_layout(batch)
         return super().prepare_data(batch)
 
+    def _purchase_value_ema_keys(self) -> dict[str, jax.Array]:
+        if not (
+            isinstance(self.model_config, RecsysAggregatedModelConfig)
+            and self.model_config.purchase_value_enabled
+        ):
+            return {}
+        return {
+            f"purchase_value/{ws}": jnp.zeros((10,), dtype=jnp.float32)
+            for ws in self.model_config.purchase_value_smoothing_windows
+        }
+
     def init(self, batch: RecsysFeaturesBatch, rng: jax.Array) -> RecsysTrainingState:
         assert isinstance(self.dataset, PhoenixDataset)
         assert isinstance(
@@ -610,8 +621,8 @@ class RecsysTrainer(Trainer):
                     dummy_3d,
                     dummy,
                     dummy,
+                    ads_head_masking=self.model_config.ads_head_masking,
                     enable_platform_metrics=self.model_config.enable_platform_metrics,
-                    split_head_training_by_source=self.model_config.split_head_training_by_source,
                     metric_mask_keys=self.model_config.metric_mask_keys,
                 ).keys()
             )
@@ -621,6 +632,7 @@ class RecsysTrainer(Trainer):
                 for m in mask_keys
                 for ws in self.smoothing_windows
             }
+            rce_ema.update(self._purchase_value_ema_keys())
 
         calib_ema = None
         if rce_ema is not None:
@@ -2346,8 +2358,8 @@ class RecsysTrainer(Trainer):
                     dummy_3d,
                     dummy,
                     dummy,
+                    ads_head_masking=self.model_config.ads_head_masking,
                     enable_platform_metrics=self.model_config.enable_platform_metrics,
-                    split_head_training_by_source=self.model_config.split_head_training_by_source,
                     metric_mask_keys=self.model_config.metric_mask_keys,
                 ).keys()
             )
@@ -2361,6 +2373,11 @@ class RecsysTrainer(Trainer):
                             reconciled_rce[key] = loaded_rce[key]
                         else:
                             reconciled_rce[key] = jnp.zeros((3,), dtype=jnp.float32)
+            for key, zeros in self._purchase_value_ema_keys().items():
+                loaded = loaded_rce.get(key) if loaded_rce else None
+                reconciled_rce[key] = (
+                    loaded if loaded is not None and loaded.shape == zeros.shape else zeros
+                )
 
             loaded_calib = self.state.calib_ema
             reconciled_calib: dict[str, jax.Array] = {}

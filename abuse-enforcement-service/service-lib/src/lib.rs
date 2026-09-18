@@ -72,6 +72,33 @@ const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 
 #[derive(Debug, Deserialize)]
+struct TopicEntry {
+    #[serde(default)]
+    cluster: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(flatten)]
+    processor: TopicConfig,
+}
+
+impl TopicEntry {
+            fn cluster<'a>(&'a self, default: &'a str) -> &'a str {
+        override_or_default(self.cluster.as_deref(), default)
+    }
+
+            fn zone<'a>(&'a self, default: &'a str) -> &'a str {
+        override_or_default(self.zone.as_deref(), default)
+    }
+}
+
+fn override_or_default<'a>(value: Option<&'a str>, default: &'a str) -> &'a str {
+    match value.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => default,
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "processor", rename_all = "snake_case")]
 enum TopicConfig {
             ScoreResult {
@@ -675,10 +702,13 @@ async fn build_kafka_producers(cfg: &Config, dynamic_config: &DynamicConfig) -> 
             warn!("kafka producer '{name}' enabled but no topic set; skipping");
             continue;
         };
+        let cluster =
+            override_or_default(spec.cluster.as_deref(), &cfg.kafka_producer_mtls_cluster);
+        let zone = override_or_default(spec.zone.as_deref(), &cfg.kafka_producer_mtls_zone);
         let producer_config = match KafkaProducerConfigBuilder::for_cluster_mtls_auto(
-            &cfg.kafka_producer_mtls_cluster,
+            cluster,
             topic.clone(),
-            Some(&cfg.kafka_producer_mtls_zone),
+            Some(zone),
         ) {
             Ok(builder) => builder.build(),
             Err(e) => {
@@ -689,7 +719,7 @@ async fn build_kafka_producers(cfg: &Config, dynamic_config: &DynamicConfig) -> 
         let mut producer = KafkaProducer::new(producer_config);
         match producer.start().await {
             Ok(()) => {
-                info!("kafka producer '{name}' started -> topic {topic}");
+                info!("kafka producer '{name}' started -> topic {topic} on {cluster} ({zone})");
                 producers.by_name.insert(name, Arc::new(producer));
             }
             Err(e) => {
@@ -1302,12 +1332,20 @@ pub(crate) fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn consumer_error_total() -> f64 {
+fn consumer_error_total(watched: &HashSet<String>) -> f64 {
     use prometheus::core::Collector;
+    if watched.is_empty() {
+        return 0.0;
+    }
     xai_kafka::metrics::CONSUMER_ERROR_COUNT
         .collect()
         .iter()
         .flat_map(|mf| &mf.metric)
+        .filter(|m| {
+            m.label
+                .iter()
+                .any(|l| l.name() == "topic" && watched.contains(l.value()))
+        })
         .filter_map(|m| m.counter.as_ref())
         .filter_map(|c| c.value)
         .sum()
@@ -1335,6 +1373,7 @@ struct WatchdogConfig {
     error_rate_per_sec: f64,
     error_self_delete_after: Duration,
     self_delete_enabled: bool,
+            error_topics: HashSet<String>,
 }
 
 async fn kafka_health_watchdog(
@@ -1346,7 +1385,7 @@ async fn kafka_health_watchdog(
     let interval_secs = cfg.interval.as_secs_f64().max(1.0);
     let mut ticker = tokio::time::interval(cfg.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut errors_prev = consumer_error_total();
+    let mut errors_prev = consumer_error_total(&cfg.error_topics);
     let mut error_bad_since: Option<tokio::time::Instant> = None;
     let mut deleted = false;
 
@@ -1358,7 +1397,7 @@ async fn kafka_health_watchdog(
         let reference = if consumed_once { last } else { started_ms };
         let stale = Duration::from_millis((now_millis() - reference).max(0) as u64);
 
-        let errors_now = consumer_error_total();
+        let errors_now = consumer_error_total(&cfg.error_topics);
         let err_rate = (errors_now - errors_prev).max(0.0) / interval_secs;
         errors_prev = errors_now;
         let error_bad_now = cfg.error_rate_per_sec > 0.0 && err_rate >= cfg.error_rate_per_sec;
@@ -1488,38 +1527,63 @@ pub async fn start_kafka_consumers(
         .dynamic_config
         .kafka_consumer_topic_labels()
         .unwrap_or(topic_labels_json);
-    let topics: HashMap<String, TopicConfig> = serde_json::from_value(effective_topic_config)
+    let topics: HashMap<String, TopicEntry> = serde_json::from_value(effective_topic_config)
         .context("topic config has wrong shape (expected {topic: {processor, ...}})")?;
+    let default_cluster = cfg.kafka_consumer_mtls_cluster.as_str();
+    let default_zone = cfg.kafka_consumer_mtls_zone.as_str();
     info!("topic config: {} topic(s)", topics.len());
-    for (topic, tc) in &topics {
-        match tc {
+    for (topic, entry) in &topics {
+        let cluster = entry.cluster(default_cluster);
+        let zone = entry.zone(default_zone);
+        match &entry.processor {
             TopicConfig::ScoreResult {
                 labels,
                 negative_labels,
             } => {
                 info!(
-                    "  topic={topic}, processor=score_result, labels={}, negative_labels={}",
+                    "  topic={topic}, cluster={cluster}, zone={zone}, processor=score_result, labels={}, negative_labels={}",
                     labels.len(),
                     negative_labels.len()
                 );
             }
             TopicConfig::StatsOnly { should_log_content } => {
                 info!(
-                    "  topic={topic}, processor=stats_only, should_log_content={should_log_content}"
+                    "  topic={topic}, cluster={cluster}, zone={zone}, processor=stats_only, should_log_content={should_log_content}"
                 );
             }
         }
     }
 
-    if cfg.kafka_self_delete_enabled && !topics.is_empty() {
-        let probe_topic = topics.keys().min().expect("topics non-empty").clone();
-        let probe_config = KafkaConsumerConfigBuilder::for_cluster_mtls_auto(
-            &cfg.kafka_consumer_mtls_cluster,
+    let s2s_certs = xai_kafka::load_s2s_certs()
+        .context("failed to load S2S mTLS client certificate for Kafka consumers")?;
+
+    let default_target = (default_cluster, default_zone);
+    let probe_topic = if cfg.kafka_self_delete_enabled {
+        preflight_probe_topic(
+            topics
+                .iter()
+                .map(|(t, e)| (t.as_str(), e.cluster(default_cluster), e.zone(default_zone))),
+            default_target,
+        )
+        .map(str::to_owned)
+    } else {
+        None
+    };
+    if cfg.kafka_self_delete_enabled && probe_topic.is_none() {
+        info!(
+            "Kafka broker preflight skipped: no topic on the default target \
+             ({default_cluster}/{default_zone}); the runtime watchdog remains the only bad-node gate"
+        );
+    }
+    if let Some(probe_topic) = probe_topic {
+        let probe_config = KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
+            default_cluster,
             probe_topic.clone(),
             format!("{}-preflight", cfg.kafka_group_id()),
-            Some(&cfg.kafka_consumer_mtls_zone),
+            s2s_certs.clone(),
+            Some(default_zone),
         )
-        .context("failed to configure Phoenix mTLS consumer preflight")?
+        .context("failed to configure mTLS consumer preflight")?
         .with_enable_auto_offset_store(false)
         .with_enable_auto_commit(false)
         .with_fetch_timeout_ms(10000)
@@ -1727,26 +1791,10 @@ pub async fn start_kafka_consumers(
     }
 
     let last_progress = Arc::new(AtomicI64::new(0));
-    if topics.is_empty() {
-        state.kafka_ready.store(true, Ordering::Relaxed);
-    } else {
-        tokio::spawn(kafka_health_watchdog(
-            last_progress.clone(),
-            state.kafka_ready.clone(),
-            WatchdogConfig {
-                interval: Duration::from_secs(cfg.kafka_watchdog_interval_secs),
-                stale_after: Duration::from_secs(cfg.kafka_watchdog_stale_secs),
-                stale_self_delete_after: Duration::from_secs(cfg.kafka_watchdog_self_delete_secs),
-                error_rate_per_sec: cfg.kafka_watchdog_error_rate_per_sec,
-                error_self_delete_after: Duration::from_secs(
-                    cfg.kafka_watchdog_error_self_delete_secs,
-                ),
-                self_delete_enabled: cfg.kafka_self_delete_enabled,
-            },
-        ));
-    }
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut error_topics: HashSet<String> = HashSet::new();
+    let topics_len = topics.len();
 
     let dedup_cache = state
         .dedup_cache
@@ -1762,28 +1810,50 @@ pub async fn start_kafka_consumers(
         max_in_flight, "Kafka consumer batch limits"
     );
 
-    let make_batch_config = |topic: &str| -> Result<BatchConsumerConfig> {
-        let kafka = KafkaConsumerConfigBuilder::for_cluster_mtls_auto(
-            &cfg.kafka_consumer_mtls_cluster,
-            topic.to_owned(),
-            topic_consumer_group_id(&kafka_group_id, topic),
-            Some(&cfg.kafka_consumer_mtls_zone),
-        )
-        .with_context(|| format!("failed to configure Phoenix mTLS consumer for {topic}"))?
-        .with_enable_auto_offset_store(false)
-        .with_enable_auto_commit(false)
-        .with_fetch_timeout_ms(10000)
-        .build();
+    let make_batch_config =
+        |topic: &str, cluster: &str, zone: &str| -> Result<BatchConsumerConfig> {
+            let kafka = KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
+                cluster,
+                topic.to_owned(),
+                topic_consumer_group_id(&kafka_group_id, topic),
+                s2s_certs.clone(),
+                Some(zone),
+            )
+            .with_context(|| {
+                format!("failed to configure {cluster} mTLS consumer for {topic} (zone {zone})")
+            })?
+            .with_enable_auto_offset_store(false)
+            .with_enable_auto_commit(false)
+            .with_fetch_timeout_ms(10000)
+            .build();
 
-        Ok(BatchConsumerConfig::new(kafka, SERVICE_NAME)
-            .with_max_messages_per_poll(max_messages_per_poll))
-    };
+            Ok(BatchConsumerConfig::new(kafka, SERVICE_NAME)
+                .with_max_messages_per_poll(max_messages_per_poll))
+        };
 
-    for (topic, topic_cfg) in topics {
-        let batch_config = make_batch_config(&topic)?;
+    for (topic, entry) in topics {
+        let cluster = entry.cluster(default_cluster).to_owned();
+        let zone = entry.zone(default_zone).to_owned();
+
+        let batch_config = match make_batch_config(&topic, &cluster, &zone) {
+            Ok(config) => config,
+            Err(e) => {
+                error!("skipping Kafka consumer for topic {topic}: {e:#}");
+                metrics::KAFKA_CONSUMER_START_TOTAL
+                    .with_label_values(&[topic.as_str(), cluster.as_str(), "config_error"])
+                    .inc();
+                continue;
+            }
+        };
+        metrics::KAFKA_CONSUMER_START_TOTAL
+            .with_label_values(&[topic.as_str(), cluster.as_str(), "started"])
+            .inc();
+        if is_default_target((&cluster, &zone), default_target) {
+            error_topics.insert(topic.clone());
+        }
         let cancel = cancel.clone();
 
-        match topic_cfg {
+        match entry.processor {
             TopicConfig::ScoreResult {
                 labels,
                 negative_labels,
@@ -1800,7 +1870,7 @@ pub async fn start_kafka_consumers(
                 };
 
                 handles.push(tokio::spawn(async move {
-                    info!("starting score_result Kafka consumer for topic: {topic}");
+                    info!("starting score_result Kafka consumer for topic {topic} on {cluster}");
                     if let Err(e) = run_batch_consumer(batch_config, processor, cancel).await {
                         error!("Kafka consumer for topic {topic} exited with error: {e}");
                     }
@@ -1813,7 +1883,7 @@ pub async fn start_kafka_consumers(
                 };
 
                 handles.push(tokio::spawn(async move {
-                    info!("starting stats_only Kafka consumer for topic: {topic}");
+                    info!("starting stats_only Kafka consumer for topic {topic} on {cluster}");
                     if let Err(e) = run_batch_consumer(batch_config, processor, cancel).await {
                         error!(
                             "stats_only Kafka consumer for topic {topic} exited with error: {e}"
@@ -1822,6 +1892,34 @@ pub async fn start_kafka_consumers(
                 }));
             }
         }
+    }
+
+    if handles.is_empty() {
+        if topics_len > 0 {
+            error!(
+                "no Kafka consumers started ({} topic(s) configured, all skipped); \
+                 serving without consumers — check \
+                 abuse_enforcement_kafka_consumer_start_total{{result=\"config_error\"}}",
+                topics_len
+            );
+        }
+        state.kafka_ready.store(true, Ordering::Relaxed);
+    } else {
+        tokio::spawn(kafka_health_watchdog(
+            last_progress.clone(),
+            state.kafka_ready.clone(),
+            WatchdogConfig {
+                interval: Duration::from_secs(cfg.kafka_watchdog_interval_secs),
+                stale_after: Duration::from_secs(cfg.kafka_watchdog_stale_secs),
+                stale_self_delete_after: Duration::from_secs(cfg.kafka_watchdog_self_delete_secs),
+                error_rate_per_sec: cfg.kafka_watchdog_error_rate_per_sec,
+                error_self_delete_after: Duration::from_secs(
+                    cfg.kafka_watchdog_error_self_delete_secs,
+                ),
+                self_delete_enabled: cfg.kafka_self_delete_enabled,
+                error_topics,
+            },
+        ));
     }
 
     let rl_config = state.dynamic_config.clone();
@@ -1852,6 +1950,21 @@ pub async fn start_kafka_consumers(
 
 fn topic_consumer_group_id(base_group_id: &str, topic: &str) -> String {
     format!("{base_group_id}-{topic}")
+}
+
+fn is_default_target(target: (&str, &str), default: (&str, &str)) -> bool {
+    target == default
+}
+
+fn preflight_probe_topic<'a, I>(topics: I, default: (&str, &str)) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+{
+    topics
+        .into_iter()
+        .filter(|(_, cluster, zone)| is_default_target((cluster, zone), default))
+        .map(|(topic, _, _)| topic)
+        .min()
 }
 
 pub async fn serve(router: Router, cfg: &Config) -> Result<()> {
@@ -1928,10 +2041,14 @@ mod router_split_tests {
 #[cfg(test)]
 mod kafka_topic_config_tests {
     use super::{
-        KAFKA_PREFLIGHT_ATTEMPTS, KAFKA_PREFLIGHT_BACKOFF, KAFKA_PREFLIGHT_TIMEOUT,
+        KAFKA_PREFLIGHT_ATTEMPTS, KAFKA_PREFLIGHT_BACKOFF, KAFKA_PREFLIGHT_TIMEOUT, TopicConfig,
+        TopicEntry, consumer_error_total, is_default_target, preflight_probe_topic,
         topic_consumer_group_id,
     };
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
+    use xai_kafka::{KafkaConsumerConfigBuilder, S2sCerts};
 
     #[test]
     fn dynamic_topics_keep_distinct_existing_group_ids() {
@@ -1952,6 +2069,223 @@ mod kafka_topic_config_tests {
         assert_eq!(KAFKA_PREFLIGHT_ATTEMPTS, 3);
         assert_eq!(KAFKA_PREFLIGHT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(KAFKA_PREFLIGHT_BACKOFF, Duration::from_secs(2));
+    }
+
+
+    fn parse(json: serde_json::Value) -> HashMap<String, TopicEntry> {
+        serde_json::from_value(json).expect("topic config should deserialize")
+    }
+
+                #[test]
+    fn topic_entry_without_override_uses_deployment_default() {
+        let topics = parse(json!({
+            "abuse.v3.score_results": {
+                "processor": "score_result",
+                "labels": ["enforcement_threshold_reached"],
+            },
+            "abuse.stats.v1": { "processor": "stats_only" },
+        }));
+
+        for topic in ["abuse.v3.score_results", "abuse.stats.v1"] {
+            let entry = &topics[topic];
+            assert_eq!(entry.cluster("phoenix"), "phoenix");
+            assert_eq!(entry.zone("atla"), "atla");
+            assert!(entry.cluster.is_none());
+        }
+        assert!(matches!(
+            topics["abuse.v3.score_results"].processor,
+            TopicConfig::ScoreResult { .. }
+        ));
+        assert!(matches!(
+            topics["abuse.stats.v1"].processor,
+            TopicConfig::StatsOnly { .. }
+        ));
+    }
+
+                    #[test]
+    fn absent_null_and_blank_all_resolve_to_the_default() {
+        let topics = parse(json!({
+            "omitted": { "processor": "stats_only" },
+            "explicit_null": { "processor": "stats_only", "cluster": null, "zone": null },
+            "empty_string": { "processor": "stats_only", "cluster": "", "zone": "" },
+            "whitespace": { "processor": "stats_only", "cluster": "   ", "zone": "\t" },
+        }));
+
+        for topic in ["omitted", "explicit_null", "empty_string", "whitespace"] {
+            let entry = &topics[topic];
+            assert_eq!(entry.cluster("phoenix"), "phoenix", "cluster for {topic}");
+            assert_eq!(entry.zone("atla"), "atla", "zone for {topic}");
+        }
+
+        let padded = parse(json!({
+            "t": { "processor": "stats_only", "cluster": " mltraining ", "zone": " atla " },
+        }));
+        assert_eq!(padded["t"].cluster("phoenix"), "mltraining");
+        assert_eq!(padded["t"].zone("atla"), "atla");
+    }
+
+            #[test]
+    fn topic_entry_override_wins_per_field() {
+        let topics = parse(json!({
+            "abuse.candidates.impersonation_scam": {
+                "processor": "score_result",
+                "labels": ["impersonation_scam_threshold_reached"],
+                "cluster": "mltraining",
+                "zone": "atla",
+            },
+            "abuse.zone_only.v1": { "processor": "stats_only", "zone": "pdxa" },
+        }));
+
+        let scam = &topics["abuse.candidates.impersonation_scam"];
+        assert_eq!(scam.cluster("phoenix"), "mltraining");
+        assert_eq!(scam.zone("atla"), "atla");
+        let TopicConfig::ScoreResult { ref labels, .. } = scam.processor else {
+            panic!("expected score_result processor alongside the cluster override");
+        };
+        assert!(labels.contains("impersonation_scam_threshold_reached"));
+
+        let zone_only = &topics["abuse.zone_only.v1"];
+        assert_eq!(zone_only.cluster("phoenix"), "phoenix");
+        assert_eq!(zone_only.zone("atla"), "pdxa");
+    }
+
+                            #[test]
+    fn preflight_probes_first_default_target_topic_only() {
+        let topics = [
+            ("abuse.candidates.impersonation_scam", "mltraining", "atla"),
+            ("abuse.v3.score_results", "phoenix", "atla"),
+            ("abuse.embeddings.user_decisions", "phoenix", "atla"),
+        ];
+
+        assert_eq!(
+            preflight_probe_topic(topics, ("phoenix", "atla")),
+            Some("abuse.embeddings.user_decisions")
+        );
+    }
+
+                    #[test]
+    fn zone_only_override_is_not_the_default_target() {
+        assert!(!is_default_target(("phoenix", "pdxa"), ("phoenix", "atla")));
+        assert!(!is_default_target(
+            ("mltraining", "atla"),
+            ("phoenix", "atla")
+        ));
+        assert!(is_default_target(("phoenix", "atla"), ("phoenix", "atla")));
+
+        let topics = [
+            ("abuse.a.zone_override", "phoenix", "pdxa"),
+            ("abuse.b.default", "phoenix", "atla"),
+        ];
+        assert_eq!(
+            preflight_probe_topic(topics, ("phoenix", "atla")),
+            Some("abuse.b.default"),
+            "a zone-only override must not be chosen as the boot probe"
+        );
+    }
+
+            #[test]
+    fn preflight_skipped_when_no_topic_on_default_target() {
+        let topics = [("abuse.candidates.impersonation_scam", "mltraining", "atla")];
+
+        assert_eq!(preflight_probe_topic(topics, ("phoenix", "atla")), None);
+        assert_eq!(preflight_probe_topic([], ("phoenix", "atla")), None);
+    }
+
+                        #[test]
+    fn error_flood_signal_counts_default_target_topics_only() {
+        let default_topic = "test.error.scope.default";
+        let override_topic = "test.error.scope.override";
+        let bump = |topic: &str, times: u64| {
+            for _ in 0..times {
+                xai_kafka::metrics::CONSUMER_ERROR_COUNT
+                    .with_label_values(&[topic, "group", "BrokerTransportFailure"])
+                    .inc();
+            }
+        };
+
+        let watched: HashSet<String> = [default_topic.to_owned()].into_iter().collect();
+        let before = consumer_error_total(&watched);
+
+        bump(override_topic, 50);
+        assert_eq!(
+            consumer_error_total(&watched),
+            before,
+            "override-cluster topic errors must not move the eviction signal"
+        );
+
+        bump(default_topic, 3);
+        assert_eq!(
+            consumer_error_total(&watched),
+            before + 3.0,
+            "default-cluster topic errors must still be counted"
+        );
+
+        assert_eq!(consumer_error_total(&HashSet::new()), 0.0);
+    }
+
+                            #[test]
+    fn override_cluster_and_zone_reach_the_kafka_bootstrap() {
+        let certs = S2sCerts::new("/ca.crt", "/tls.crt", "/tls.key");
+
+        let config = KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
+            "mltraining",
+            "abuse.candidates.impersonation_scam",
+            "xai-abuse-enforcement-service-fou-staging-abuse.candidates.impersonation_scam",
+            certs.clone(),
+            Some("atla"),
+        )
+        .expect("mltraining/atla is a registered mTLS cluster+zone")
+        .build();
+
+        assert_eq!(
+            config.base_config.dest,
+            "mltraining-mtls-bootstrap.kafka.prod.atla-prod-messaging.kafka.kube.atla.twitter.com:9095"
+        );
+        assert_eq!(
+            config.base_config.topic,
+            "abuse.candidates.impersonation_scam"
+        );
+
+        let default_cluster = KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
+            "phoenix",
+            "abuse.v3.score_results",
+            "group",
+            certs.clone(),
+            Some("atla"),
+        )
+        .expect("phoenix/atla is a registered mTLS cluster+zone")
+        .build();
+        assert!(
+            default_cluster
+                .base_config
+                .dest
+                .starts_with("phoenix-mtls-bootstrap."),
+            "unexpected default dest: {}",
+            default_cluster.base_config.dest
+        );
+    }
+
+                    #[test]
+    fn unresolvable_override_is_an_error_not_a_panic() {
+        let certs = S2sCerts::new("/ca.crt", "/tls.crt", "/tls.key");
+
+        for (cluster, zone) in [
+            ("not-a-cluster", "atla"), 
+            ("bluebird-1", "atla"),    
+            ("mltraining", "iad"),     
+        ] {
+            assert!(
+                KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
+                    cluster,
+                    "some.topic",
+                    "group",
+                    certs.clone(),
+                    Some(zone),
+                )
+                .is_err(),
+                "expected {cluster}/{zone} to be rejected"
+            );
+        }
     }
 }
 

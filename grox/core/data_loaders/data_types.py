@@ -720,8 +720,6 @@ class Post(BaseModel):
 
     def _collect_urls(self) -> list[str]:
         urls: list[str] = list(self.urls or [])
-        if self.user and self.user.urls:
-            urls.extend(self.user.urls)
         if self.card and hasattr(self.card, "url") and self.card.url:
             urls.append(self.card.url)
         if self.cardsV2:
@@ -730,6 +728,8 @@ class Post(BaseModel):
                     for uc in cv.unified_cards:
                         if hasattr(uc, "url") and uc.url:
                             urls.append(uc.url)
+        if self.user and self.user.urls:
+            urls.extend(self.user.urls)
         return urls
 
     def extract_domains(self) -> list[str]:
@@ -739,11 +739,11 @@ class Post(BaseModel):
             except Exception:
                 return None
 
-        domains = set()
+        domains: dict[str, None] = {}
         for url in self._collect_urls():
             h = (hostname(url) or "").strip().lower()
             if h and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", h):
-                domains.add(h)
+                domains[h] = None
         return list(domains)
 
     @classmethod

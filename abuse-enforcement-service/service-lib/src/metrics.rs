@@ -167,6 +167,14 @@ lazy_static! {
             .unwrap();
 
 
+                                                pub static ref KAFKA_CONSUMER_START_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_kafka_consumer_start_total",
+            "Per-topic consumer startup outcomes at boot.",
+            &["topic", "cluster", "result"])  
+            .unwrap();
+
+
                             pub static ref RULES_YAML_COMPILED: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_rules_yaml_compiled_total",

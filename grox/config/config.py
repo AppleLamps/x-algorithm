@@ -199,6 +199,13 @@ class PromptTokensConfig(BaseModel):
     image_pad: str = ""
 
 
+class MediaReferenceBundleConfig(BaseModel):
+    model_config = _FROZEN
+
+    uri: str
+    refresh_interval_s: int = 900
+
+
 class GroxConfig(BaseSettings):
     metrics: MetricsConfig = MetricsConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -209,6 +216,9 @@ class GroxConfig(BaseSettings):
     eapi_models: dict[str, EapiModelConfig] = Field(default_factory=dict)
     oai_models: dict[str, OaiModelConfig] = Field(default_factory=dict)
     media_hydration: MediaHydrationConfig = MediaHydrationConfig()
+    media_reference_bundles: dict[str, MediaReferenceBundleConfig] = Field(
+        default_factory=dict
+    )
     product_media: ProductMediaConfig = ProductMediaConfig()
     nightowl: NightOwlConfig | None = NightOwlConfig()
     kafka_producer_topics: dict[str, KafkaProducerConfig] = Field(default_factory=dict)

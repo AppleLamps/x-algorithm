@@ -4,7 +4,7 @@ use std::sync::Arc;
 use growthbook_rust_sdk::client::{GrowthBookClient, GrowthBookClientTrait};
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::facts::EntityType;
 use crate::sliding_window::SlidingWindowLimiter;
@@ -50,6 +50,10 @@ pub struct ProducerSpec {
     pub enabled: bool,
     #[serde(default)]
     pub topic: Option<String>,
+    #[serde(default)]
+    pub cluster: Option<String>,
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 #[derive(Clone)]
@@ -224,11 +228,15 @@ fn kafka_producers_from_config(config: Option<&Value>) -> HashMap<String, Produc
         return HashMap::new();
     };
     obj.iter()
-        .filter_map(|(name, v)| {
-            serde_json::from_value::<ProducerSpec>(v.clone())
-                .ok()
-                .map(|spec| (name.clone(), spec))
-        })
+        .filter_map(
+            |(name, v)| match serde_json::from_value::<ProducerSpec>(v.clone()) {
+                Ok(spec) => Some((name.clone(), spec)),
+                Err(e) => {
+                    warn!("kafka producer '{name}' config is malformed; sink disabled: {e}");
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -586,6 +594,27 @@ mod tests {
 
         assert!(kafka_producers_from_config(Some(&json!({ "other": 1 }))).is_empty());
         assert!(kafka_producers_from_config(None).is_empty());
+    }
+
+    #[test]
+    fn kafka_producers_from_config_carries_optional_cluster_override() {
+        let cfg = json!({
+            "kafka": { "producer": {
+                "decisions": { "enabled": true, "topic": "t1" },
+                "elsewhere": {
+                    "enabled": true,
+                    "topic": "t2",
+                    "cluster": "coredata",
+                    "zone": "pdxa",
+                },
+            } },
+        });
+        let m = kafka_producers_from_config(Some(&cfg));
+
+        assert_eq!(m["decisions"].cluster, None);
+        assert_eq!(m["decisions"].zone, None);
+        assert_eq!(m["elsewhere"].cluster.as_deref(), Some("coredata"));
+        assert_eq!(m["elsewhere"].zone.as_deref(), Some("pdxa"));
     }
 
     #[tokio::test]

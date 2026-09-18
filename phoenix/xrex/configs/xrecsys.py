@@ -643,10 +643,9 @@ for config in configs:
             mask_candidate_positive_when_negative_action_present=mparams.get(
                 "mask_candidate_positive_when_negative_action_present", False
             ),
-            train_view_through_heads=mparams.get("train_view_through_heads", False),
+            ads_head_masking=mparams.get("ads_head_masking", False),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
-            split_head_training_by_source=mparams.get("split_head_training_by_source", False),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
             condition_search_relevance_on_prompt=mparams.get(
